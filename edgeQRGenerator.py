@@ -2,6 +2,10 @@
 import argparse
 import base64
 import io
+import zlib
+import sys
+
+
 from PIL import Image
 
 # Try importing qrcode; if unavailable, instruct how to install it in a venv and exit.
@@ -58,6 +62,56 @@ def generate_qr_code(data, filename='qrcode.png'):
     img.save(filename)
     print(f"QR code saved as {filename}")
 
+def _write(data: bytes) -> None:
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+def kitty_send_image_rgb(image: Image.Image, *, max_cols=None, max_rows=None) -> None:
+    """
+    Send an image via Kitty graphics protocol using raw RGB (f=24).
+    Optional max_cols/max_rows to constrain size in terminal cells (kitty will scale).
+    """
+    im = image.convert("RGB")
+    w, h = im.size
+    raw = im.tobytes()  # RGBRGB...
+
+    # Optional compression (Kitty supports zlib via o=z)
+    comp = zlib.compress(raw, level=6)
+
+    # Kitty requires base64 payload; can be chunked.
+    b64 = base64.b64encode(comp)
+
+    # Build header fields.
+    # a=T: transmit + display
+    # f=24: raw RGB
+    # s,w and v,h: pixel dimensions
+    # o=z: zlib compressed
+    # t=d: direct data (base64 payload follows)
+    # C=1: more chunks follow (for intermediate chunks)
+    # m=1/0: more data follows / last chunk (kitty uses m)
+    #
+    # Optionally:
+    # c,r = placement size in cells (kitty scales into c x r cells)
+    fields = [f"a=T", f"f=24", f"s={w}", f"v={h}", "o=z", "t=d"]
+    if max_cols is not None:
+        fields.append(f"c={int(max_cols)}")
+    if max_rows is not None:
+        fields.append(f"r={int(max_rows)}")
+
+    # Chunk base64 to keep escape sequences reasonably sized.
+    # 4096 is conservative and works well.
+    CHUNK = 4096
+    for i in range(0, len(b64), CHUNK):
+        chunk = b64[i : i + CHUNK]
+        more = 1 if (i + CHUNK) < len(b64) else 0
+        # m=1 indicates more chunks follow; m=0 indicates last chunk
+        header = ",".join(fields + [f"m={more}"])
+        seq = b"\x1b_G" + header.encode("ascii") + b";" + chunk + b"\x1b\\"
+        _write(seq)
+
+    # Newline so subsequent terminal output starts below the image.
+    _write(b"\n")
+
 def main():
     parser = argparse.ArgumentParser(description="Generate a QR code image from data")
     parser.add_argument('data', help='Data/text to encode in the QR code')
@@ -69,7 +123,8 @@ def main():
     generate_qr_code(data, output_filename)
     # Optional: Display the generated QR code
     img = Image.open(output_filename)
-    img.show()
+    # img.show()
+    kitty_send_image_rgb(img)
 
 
 # Base64-encoded PNG used as an overlay on the generated QR code.
